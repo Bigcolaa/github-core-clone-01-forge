@@ -50,8 +50,7 @@ func main() {
 	// reporting a host-sized CPU count and avoid GC cycles during the timed
 	// benchmark; the memory limit is a safety net well below the 1 GiB pod cap.
 	runtime.GOMAXPROCS(1)
-	debug.SetGCPercent(-1)
-	debug.SetMemoryLimit(512 << 20)
+	debug.SetGCPercent(1000)
 
 	envURL := os.Getenv("MAKEFUN_ENV_URL")
 	if envURL == "" {
