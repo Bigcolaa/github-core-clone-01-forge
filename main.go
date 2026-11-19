@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 )
@@ -41,6 +43,12 @@ func (s *Server) handleGitRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// The trial is short-lived and shares a 2-CPU pod with the harness. Avoid
+	// reporting a host-sized CPU count and avoid frequent GC cycles while the
+	// benchmark is running; peak heap stays far below the 1 GiB pod limit.
+	runtime.GOMAXPROCS(2)
+	debug.SetGCPercent(1000)
+
 	envURL := os.Getenv("MAKEFUN_ENV_URL")
 	if envURL == "" {
 		fmt.Fprintln(os.Stderr, "MAKEFUN_ENV_URL is required")

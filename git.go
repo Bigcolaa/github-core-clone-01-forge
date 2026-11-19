@@ -437,7 +437,17 @@ func (rp *Repo) packFor(fr fetchRequest) ([]byte, []string, []string) {
 	if c := rp.packCache.Load(); c != nil && c.key == key {
 		return c.b, c.shallow, c.unshallow
 	}
+	rp.packGen.Lock()
+	defer rp.packGen.Unlock()
+	if c := rp.packCache.Load(); c != nil && c.key == key {
+		return c.b, c.shallow, c.unshallow
+	}
+	return rp.packForSlow(fr, key)
+}
 
+// packForSlow is called with rp.mu read-locked and rp.packGen held, so a burst
+// of identical clones generates the pack once and the rest reuse the cached bytes.
+func (rp *Repo) packForSlow(fr fetchRequest, key string) ([]byte, []string, []string) {
 	shallowSet := map[string]bool{}
 	for _, oid := range fr.shallow {
 		shallowSet[oid] = true

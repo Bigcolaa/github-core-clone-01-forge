@@ -108,6 +108,7 @@ type Repo struct {
 	advV0     atomic.Pointer[advertCacheEntry]
 	advRecv   atomic.Pointer[advertCacheEntry]
 	packCache atomic.Pointer[packCacheEntry]
+	packGen   sync.Mutex // serializes pack generation on a cache miss only
 }
 
 func newRepo(name, owner, desc string, private bool) *Repo {
@@ -189,14 +190,20 @@ func pullID(r *Repo, n int) string {
 
 // ---- git object helpers ----
 
+var hashBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 512); return &b }}
+
 func hashObject(kind string, data []byte) string {
-	h := sha1.New()
-	h.Write([]byte(kind))
-	h.Write([]byte{' '})
-	h.Write([]byte(strconv.Itoa(len(data))))
-	h.Write([]byte{0})
-	h.Write(data)
-	return hex.EncodeToString(h.Sum(nil))
+	bp := hashBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+	buf = append(buf, kind...)
+	buf = append(buf, ' ')
+	buf = strconv.AppendInt(buf, int64(len(data)), 10)
+	buf = append(buf, 0)
+	buf = append(buf, data...)
+	sum := sha1.Sum(buf)
+	*bp = buf[:0]
+	hashBufPool.Put(bp)
+	return hex.EncodeToString(sum[:])
 }
 
 // putObjectLocked stores an object. Caller holds r.mu for writing.
@@ -407,8 +414,20 @@ func (r *Repo) isAncestorLocked(old, new string) bool {
 	if old == new {
 		return true
 	}
-	seen := map[string]bool{}
-	queue := []string{new}
+	obj := r.objectLocked(new)
+	if obj == nil {
+		return false
+	}
+	ci := parseCommit(obj.Data)
+	// The benchmark's pushes advance the tip by one commit, so old is almost
+	// always a direct parent: resolve that without allocating a walk set.
+	for _, p := range ci.Parents {
+		if p == old {
+			return true
+		}
+	}
+	seen := map[string]bool{new: true}
+	queue := append([]string(nil), ci.Parents...)
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
@@ -416,11 +435,11 @@ func (r *Repo) isAncestorLocked(old, new string) bool {
 			continue
 		}
 		seen[cur] = true
-		obj := r.objectLocked(cur)
-		if obj == nil {
+		o := r.objectLocked(cur)
+		if o == nil {
 			continue
 		}
-		for _, p := range parseCommit(obj.Data).Parents {
+		for _, p := range parseCommit(o.Data).Parents {
 			if p == old {
 				return true
 			}
