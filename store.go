@@ -124,10 +124,11 @@ func newRepo(name, owner, desc string, private bool) *Repo {
 
 // Global store.
 type Store struct {
-	mu    sync.RWMutex
-	repos map[string]*Repo
-	login string
-	token string
+	mu         sync.RWMutex
+	repos      map[string]*Repo
+	login      string
+	token      string
+	authBearer string
 }
 
 var store = &Store{repos: map[string]*Repo{}, login: "adaiversen"}
@@ -213,6 +214,14 @@ func (r *Repo) putObjectLocked(kind string, data []byte) string {
 		r.objects[oid] = &GitObject{Kind: kind, Data: append([]byte(nil), data...)}
 	}
 	return oid
+}
+
+// putObjectWithOIDLocked stores an object whose id the caller already computed
+// while parsing a pack, avoiding a second hash and a second copy.
+func (r *Repo) putObjectWithOIDLocked(kind string, data []byte, oid string) {
+	if _, ok := r.objects[oid]; !ok {
+		r.objects[oid] = &GitObject{Kind: kind, Data: data}
+	}
 }
 
 func (r *Repo) objectLocked(oid string) *GitObject { return r.objects[oid] }

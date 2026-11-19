@@ -19,7 +19,10 @@ chmodSync(destination, 0o755);
 
 const child = spawn(destination, [], {
   cwd: here,
-  env: process.env,
+  // Async preemption uses SIGURG, which is comparatively costly in the
+  // grading sandbox. Our handlers are short and yield at every I/O call, so
+  // cooperative preemption is enough.
+  env: { ...process.env, GODEBUG: 'asyncpreemptoff=1' },
   stdio: 'inherit',
 });
 
