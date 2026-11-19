@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -50,7 +51,8 @@ func main() {
 	// reporting a host-sized CPU count and avoid GC cycles during the timed
 	// benchmark; the memory limit is a safety net well below the 1 GiB pod cap.
 	runtime.GOMAXPROCS(1)
-	debug.SetGCPercent(1000)
+	debug.SetGCPercent(-1)
+	debug.SetMemoryLimit(512 << 20)
 
 	envURL := os.Getenv("MAKEFUN_ENV_URL")
 	if envURL == "" {
@@ -61,7 +63,10 @@ func main() {
 	store.token = os.Getenv("MAKEFUN_SHOP_TOKEN")
 	store.authBearer = "Bearer " + store.token
 
-	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	// The clone workload runs 50 concurrent sideband-pack responses. A larger
+	// send buffer lets gVisor absorb those writes without blocking the single
+	// runnable P. Failure to tune is harmless; net/http still works as before.
+	ln, err := (&net.ListenConfig{Control: tuneListener}).Listen(context.Background(), "tcp", "0.0.0.0:0")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
