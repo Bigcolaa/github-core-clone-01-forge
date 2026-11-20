@@ -121,11 +121,10 @@ func newRepo(name, owner, desc string, private bool) *Repo {
 		Name: name, FullName: owner + "/" + name, Owner: owner,
 		Description: desc, Private: private, DefaultBranch: "main",
 		branches: map[string]string{}, tags: map[string]string{},
-		// Pre-size only the issues slice, grown by the timed write workload.
-		// Eagerly sizing the maps would allocate ~20 KB per repo, and trials
-		// create hundreds of repos, adding GC pressure to later workloads;
-		// maps grow on demand instead.
-		objects: map[string]*GitObject{}, issues: make([]*Issue, 0, 512), issueByN: map[int]*Issue{},
+		// All collections grow on demand. Eagerly sizing any of them costs
+		// memory for every repo created during feature checks (hundreds per
+		// trial), and that GC pressure lands on the timed read/write workloads.
+		objects: map[string]*GitObject{}, issues: []*Issue{}, issueByN: map[int]*Issue{},
 		prs: []*Pull{}, prByN: map[int]*Pull{}, labels: map[string]string{},
 		comments: map[int][]*Comment{}, files: map[string]map[string]string{},
 	}
