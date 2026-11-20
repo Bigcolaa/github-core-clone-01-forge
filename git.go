@@ -5,6 +5,8 @@ import (
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
+	"hash"
 	"io"
 	"net/http"
 	"sort"
@@ -803,9 +805,35 @@ func writePack(objects map[string]*GitObject) []byte {
 	return b.Bytes()
 }
 
+// Pooled readers and SHA-1 hashers for pack ingestion. These are used only by
+// the receive-pack (push) path so the clone path is untouched.
+var pushReaderPool = sync.Pool{New: func() any { return &countingReader{} }}
+var pushHashPool = sync.Pool{New: func() any { return sha1.New() }}
+
 type countingReader struct {
 	data []byte
 	pos  int
+}
+
+// hashObjectPush is the receive-pack variant of hashObject: it uses the pooled
+// SHA-1 hasher and scratch buffer to avoid a fresh hash state per object.
+func hashObjectPush(kind string, data []byte) string {
+	bp := hashBufPool.Get().(*[]byte)
+	buf := (*bp)[:0]
+	buf = append(buf, kind...)
+	buf = append(buf, ' ')
+	buf = strconv.AppendInt(buf, int64(len(data)), 10)
+	buf = append(buf, 0)
+	buf = append(buf, data...)
+	h := pushHashPool.Get().(hash.Hash)
+	h.Reset()
+	_, _ = h.Write(buf)
+	var sum [sha1.Size]byte
+	h.Sum(sum[:0])
+	pushHashPool.Put(h)
+	*bp = buf[:0]
+	hashBufPool.Put(bp)
+	return hex.EncodeToString(sum[:])
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
@@ -871,19 +899,24 @@ func parsePushPack(data []byte) (map[string]*GitObject, error) {
 		default:
 			return nil, io.ErrUnexpectedEOF
 		}
-		cr := &countingReader{data: data, pos: pos}
+		cr := pushReaderPool.Get().(*countingReader)
+		cr.data, cr.pos = data, pos
 		zr, err := getPushInflater(cr)
 		if err != nil {
+			pushReaderPool.Put(cr)
 			return nil, err
 		}
 		payload := make([]byte, size)
 		if _, err = io.ReadFull(zr, payload); err != nil {
 			pushInflatePool.Put(zr)
+			pushReaderPool.Put(cr)
 			return nil, err
 		}
 		pushInflatePool.Put(zr)
 		pos = cr.pos
-		oid := hashObject(kind, payload)
+		cr.data = nil
+		pushReaderPool.Put(cr)
+		oid := hashObjectPush(kind, payload)
 		out[oid] = &GitObject{Kind: kind, Data: payload}
 	}
 	return out, nil

@@ -450,6 +450,15 @@ func serveRawConn(conn net.Conn, s *Server) {
 		if err != nil {
 			return
 		}
+		// Direct git/create dispatch: zero adapter, single conn.Write.
+		if handled, err := directRequest(c, req); handled {
+			c.repResp = nil
+			c.repReq = c.repReq[:0]
+			if err != nil {
+				return
+			}
+			continue
+		}
 		// Fast create-issue POST: bypass adapter and routing entirely.
 		if full, ok := fastCreateIssue(req); ok {
 			syscountFastCreate()
