@@ -65,13 +65,15 @@ func main() {
 	}
 	ln = instrumentListener(ln)
 	port := ln.Addr().(*net.TCPAddr).Port
-	srv := &http.Server{
-		Handler:           &Server{},
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
-	}
+	handler := &Server{}
 	go func() {
-		_ = srv.Serve(ln)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveRawConn(conn, handler)
+		}
 	}()
 
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -103,7 +105,7 @@ func main() {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	_ = srv.Close()
+	_ = ln.Close()
 	dumpSyscounts()
 	os.Exit(0)
 }

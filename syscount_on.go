@@ -33,6 +33,13 @@ var (
 
 type scConn struct{ net.Conn }
 
+func (c *scConn) SetNoDelay(noDelay bool) error {
+	if tc, ok := c.Conn.(*net.TCPConn); ok {
+		return tc.SetNoDelay(noDelay)
+	}
+	return nil
+}
+
 func (c *scConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	scReads.Add(1)
