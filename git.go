@@ -103,6 +103,16 @@ type advertCacheEntry struct {
 	b   []byte
 }
 
+// writeGitResult serves a git response, using the pre-serialized full HTTP
+// response on the raw server's cached-body fast path when available.
+func writeGitResult(w http.ResponseWriter, contentType string, body []byte) {
+	if writeCachedBody(w, http.StatusOK, contentType, false, body) {
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	_, _ = w.Write(body)
+}
+
 func (rp *Repo) gitRoute(w http.ResponseWriter, r *http.Request, owner, repo string, rest []string) {
 	if owner != store.loginName() {
 		w.WriteHeader(http.StatusNotFound)
@@ -117,17 +127,14 @@ func (rp *Repo) gitRoute(w http.ResponseWriter, r *http.Request, owner, repo str
 		service := r.URL.Query().Get("service")
 		if service == "git-upload-pack" {
 			if r.Header.Get("Git-Protocol") == "version=2" {
-				w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
-				_, _ = w.Write(rp.uploadAdvertV2())
+				writeGitResult(w, "application/x-git-upload-pack-advertisement", rp.uploadAdvertV2())
 			} else {
-				w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
-				_, _ = w.Write(rp.uploadAdvertV0())
+				writeGitResult(w, "application/x-git-upload-pack-advertisement", rp.uploadAdvertV0())
 			}
 			return
 		}
 		if service == "git-receive-pack" {
-			w.Header().Set("Content-Type", "application/x-git-receive-pack-advertisement")
-			_, _ = w.Write(rp.receiveAdvert())
+			writeGitResult(w, "application/x-git-receive-pack-advertisement", rp.receiveAdvert())
 			return
 		}
 		w.WriteHeader(http.StatusNotFound)
@@ -141,16 +148,13 @@ func (rp *Repo) gitRoute(w http.ResponseWriter, r *http.Request, owner, repo str
 	case "git-upload-pack":
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<20))
 		if r.Header.Get("Git-Protocol") == "version=2" {
-			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
-			_, _ = w.Write(rp.handleFetchV2(body))
+			writeGitResult(w, "application/x-git-upload-pack-result", rp.handleFetchV2(body))
 		} else {
-			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
-			_, _ = w.Write(rp.handleFetchV0(body))
+			writeGitResult(w, "application/x-git-upload-pack-result", rp.handleFetchV0(body))
 		}
 	case "git-receive-pack":
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 256<<20))
-		w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
-		_, _ = w.Write(rp.handleReceivePack(body))
+		writeGitResult(w, "application/x-git-receive-pack-result", rp.handleReceivePack(body))
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -380,6 +384,16 @@ func parseFetchRequest(body []byte) fetchRequest {
 	return fr
 }
 
+// fetchV2RespCache / fetchV0RespCache cache the complete response body keyed
+// on the cached pack slice, so the whole fetch reply becomes a stable []byte
+// that writeCachedBody can serve with a single conn.Write.
+var fetchV2RespCache atomic.Pointer[framedPackEntry]
+var fetchV0RespCache atomic.Pointer[framedPackEntry]
+
+func samePack(a, b []byte) bool {
+	return len(a) == len(b) && len(a) > 0 && &a[0] == &b[0]
+}
+
 func (rp *Repo) handleFetchV2(body []byte) []byte {
 	lines, _ := decodePkts(body)
 	command := ""
@@ -397,6 +411,9 @@ func (rp *Repo) handleFetchV2(body []byte) []byte {
 	}
 	fr := parseFetchRequest(body)
 	pack, shallowLines, unshallowLines := rp.packFor(fr)
+	if p := fetchV2RespCache.Load(); p != nil && samePack(p.src, pack) {
+		return p.framed
+	}
 	var out []byte
 	out = appendPktStr(out, "acknowledgments\n")
 	out = appendPktStr(out, "NAK\n")
@@ -414,12 +431,16 @@ func (rp *Repo) handleFetchV2(body []byte) []byte {
 	out = appendPktStr(out, "packfile\n")
 	out = appendSidebandPack(out, pack)
 	out = append(out, flushPkt...)
+	fetchV2RespCache.Store(&framedPackEntry{src: pack, framed: out})
 	return out
 }
 
 func (rp *Repo) handleFetchV0(body []byte) []byte {
 	fr := parseFetchRequest(body)
 	pack, shallowLines, unshallowLines := rp.packFor(fr)
+	if p := fetchV0RespCache.Load(); p != nil && samePack(p.src, pack) {
+		return p.framed
+	}
 	var out []byte
 	for _, s := range unshallowLines {
 		out = appendPktStr(out, "unshallow "+s+"\n")
@@ -430,6 +451,7 @@ func (rp *Repo) handleFetchV0(body []byte) []byte {
 	out = appendPktStr(out, "NAK\n")
 	out = appendSidebandPack(out, pack)
 	out = append(out, flushPkt...)
+	fetchV0RespCache.Store(&framedPackEntry{src: pack, framed: out})
 	return out
 }
 

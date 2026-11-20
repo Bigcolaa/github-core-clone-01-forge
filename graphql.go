@@ -407,6 +407,7 @@ func setIssueState(iss *Issue, state string) {
 	target.mu.Lock()
 	iss.State = state
 	iss.cache.Store(nil)
+	iss.httpCache.Store(nil)
 	target.mu.Unlock()
 }
 

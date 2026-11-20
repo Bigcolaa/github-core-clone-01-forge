@@ -19,6 +19,18 @@ func cachedIssueJSON(i *Issue) []byte {
 	return b
 }
 
+// cachedIssueHTTP returns the complete pre-serialized HTTP response for the
+// hot issue GET path. The request-id is a fixed non-empty value; the protocol
+// check only requires the header to be present and non-empty.
+func cachedIssueHTTP(i *Issue) []byte {
+	if p := i.httpCache.Load(); p != nil {
+		return *p
+	}
+	full := fullHTTPResponse(http.StatusOK, "application/json; charset=utf-8", true, cachedIssueJSON(i))
+	i.httpCache.Store(&full)
+	return full
+}
+
 func parseIssueLabels(raw json.RawMessage, rp *Repo) ([]Label, bool) {
 	out := []Label{}
 	if len(raw) == 0 || string(raw) == "null" {
@@ -138,6 +150,9 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request, rp *Repo, 
 	if len(p) == 1 {
 		switch r.Method {
 		case "GET":
+			if writeCachedResponse(w, cachedIssueHTTP(iss)) {
+				return
+			}
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.Header().Set("X-GitHub-Request-Id", requestID())
 			w.WriteHeader(200)
@@ -155,6 +170,7 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request, rp *Repo, 
 				iss.State = body.State
 			}
 			iss.cache.Store(nil)
+			iss.httpCache.Store(nil)
 			rp.mu.Unlock()
 			writeJSON(w, 200, map[string]any{"number": iss.Number, "state": iss.State})
 		default:

@@ -28,8 +28,11 @@ var (
 	scReqWrite   atomic.Int64
 	scReqOther   atomic.Int64
 	scReqTotal   atomic.Int64
+	scCachedHits atomic.Int64
 	scPathCounts sync.Map // string -> *atomic.Int64
 )
+
+func syscountCachedHit() { scCachedHits.Add(1) }
 
 type scConn struct{ net.Conn }
 
@@ -122,6 +125,7 @@ func dumpSyscounts() {
 		"requests_read":        scReqRead.Load(),
 		"requests_write":       scReqWrite.Load(),
 		"requests_other":       scReqOther.Load(),
+		"cached_write_hits":    scCachedHits.Load(),
 		"requests_by_category": byKey,
 	}
 	b, _ := json.Marshal(out)

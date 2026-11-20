@@ -9,6 +9,8 @@ package main
 //
 // Handlers are left completely unchanged: a thin adapter materializes the
 // small subset of *http.Request / http.ResponseWriter they actually use.
+// Hot cached paths bypass the adapter entirely via WriteCached: a
+// pre-serialized full HTTP response goes straight to conn.Write.
 
 import (
 	"bytes"
@@ -18,9 +20,25 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 )
 
-const rawReadBufSize = 512 << 10 // one read captures head + body of any benchmark request
+const (
+	rawSmallBufSize = 8 << 10   // clone/read/ls-refs requests are ~440 B total
+	rawLargeBufSize = 512 << 10 // swapped in only for large bodies (receive-pack)
+)
+
+type rawBuf struct{ b []byte }
+
+var rawSmallPool = sync.Pool{New: func() any {
+	return &rawBuf{b: make([]byte, rawSmallBufSize)}
+}}
+var rawLargePool = sync.Pool{New: func() any {
+	return &rawBuf{b: make([]byte, rawLargeBufSize)}
+}}
+var rawOutPool = sync.Pool{New: func() any {
+	return &rawBuf{b: make([]byte, 8<<10)}
+}}
 
 // rawRequest holds only the request fields the handlers consume. There is no
 // header map: header scanning writes directly into these fixed fields.
@@ -38,11 +56,11 @@ type rawRequest struct {
 
 type rawConnState struct {
 	conn   net.Conn
-	rbuf   []byte // reusable read buffer
-	rend   int    // valid bytes are rbuf[:rend]
-	rstart int    // start of the current unparsed request
-	wbuf   []byte // reusable response-body buffer
-	outbuf []byte // reusable full-response buffer
+	buf    *rawBuf // pooled read buffer (small by default)
+	rend   int     // valid bytes are buf.b[:rend]
+	rstart int     // start of the current unparsed request
+	out    *rawBuf // pooled full-response scratch buffer
+	body   *rawBuf // pooled response-body accumulation buffer
 }
 
 func newRawConnState(conn net.Conn) *rawConnState {
@@ -50,22 +68,54 @@ func newRawConnState(conn net.Conn) *rawConnState {
 		_ = nd.SetNoDelay(true)
 	}
 	return &rawConnState{
-		conn:   conn,
-		rbuf:   make([]byte, rawReadBufSize),
-		wbuf:   make([]byte, 0, 4096),
-		outbuf: make([]byte, 0, rawReadBufSize+4096),
+		conn: conn,
+		buf:  rawSmallPool.Get().(*rawBuf),
+		out:  rawOutPool.Get().(*rawBuf),
+		body: rawOutPool.Get().(*rawBuf),
 	}
 }
 
-// readAppend appends bytes from the connection to the reusable buffer,
-// growing it only when a single request exceeds the initial capacity.
-func (c *rawConnState) readAppend() (int, error) {
-	if c.rend == len(c.rbuf) {
-		nb := make([]byte, len(c.rbuf)*2)
-		copy(nb, c.rbuf[:c.rend])
-		c.rbuf = nb
+func (c *rawConnState) release() {
+	if len(c.buf.b) == rawSmallBufSize {
+		rawSmallPool.Put(c.buf)
+	} else if len(c.buf.b) == rawLargeBufSize {
+		rawLargePool.Put(c.buf)
 	}
-	n, err := c.conn.Read(c.rbuf[c.rend:])
+	rawOutPool.Put(c.out)
+	rawOutPool.Put(c.body)
+}
+
+// ensureCapacity swaps in a pooled large buffer when a request body exceeds
+// the small buffer. The small buffer returns to its pool immediately.
+func (c *rawConnState) ensureCapacity(need int) {
+	if need <= len(c.buf.b) {
+		return
+	}
+	size := rawLargeBufSize
+	if need > size {
+		size = need
+	}
+	var nb *rawBuf
+	if size == rawLargeBufSize {
+		nb = rawLargePool.Get().(*rawBuf)
+	} else {
+		nb = &rawBuf{b: make([]byte, size)}
+	}
+	copy(nb.b, c.buf.b[:c.rend])
+	old := c.buf
+	c.buf = nb
+	if len(old.b) == rawSmallBufSize {
+		rawSmallPool.Put(old)
+	} else if len(old.b) == rawLargeBufSize && old != nb {
+		rawLargePool.Put(old)
+	}
+}
+
+func (c *rawConnState) readAppend() (int, error) {
+	if c.rend == len(c.buf.b) {
+		c.ensureCapacity(len(c.buf.b) * 2)
+	}
+	n, err := c.conn.Read(c.buf.b[c.rend:])
 	c.rend += n
 	return n, err
 }
@@ -76,22 +126,24 @@ var crlf = []byte("\r\n")
 // nextRequest parses exactly one request from the reusable buffer, performing
 // one conn.Read for the common case where head and body arrive together.
 func (c *rawConnState) nextRequest() (*rawRequest, error) {
-	// Move any leftover bytes from a previous request to the front.
 	if c.rstart > 0 {
-		copy(c.rbuf, c.rbuf[c.rstart:c.rend])
+		copy(c.buf.b, c.buf.b[c.rstart:c.rend])
 		c.rend -= c.rstart
 		c.rstart = 0
 	}
 	var readErr error
 	for {
-		if idx := bytes.Index(c.rbuf[:c.rend], crlfcrlf); idx >= 0 {
+		if idx := bytes.Index(c.buf.b[:c.rend], crlfcrlf); idx >= 0 {
 			he := idx + len(crlfcrlf)
-			req, err := parseRequestHead(c.rbuf[:he])
+			req, err := parseRequestHead(c.buf.b[:he])
 			if err != nil {
 				return nil, err
 			}
+			// Grow to a pooled large buffer only when Content-Length demands it.
+			if need := he + req.ContentLength; need > len(c.buf.b) {
+				c.ensureCapacity(need)
+			}
 			end := he + req.ContentLength
-			// Complete the body. Normally already present from the first read.
 			for c.rend < end {
 				n, err := c.readAppend()
 				if err != nil && n == 0 {
@@ -101,7 +153,7 @@ func (c *rawConnState) nextRequest() (*rawRequest, error) {
 					return nil, io.ErrUnexpectedEOF
 				}
 			}
-			req.Body = c.rbuf[he:end]
+			req.Body = c.buf.b[he:end]
 			c.rstart = end
 			return req, nil
 		}
@@ -174,9 +226,6 @@ func parseRequestHead(head []byte) (*rawRequest, error) {
 	return req, nil
 }
 
-// httpRequest materializes just enough of *http.Request for the existing
-// handlers. Body is a reader over the reusable buffer; handlers consume it
-// synchronously before the buffer is reused for the next request.
 func (c *rawConnState) httpRequest(req *rawRequest) *http.Request {
 	u := &url.URL{Path: req.Path, RawQuery: req.RawQuery}
 	h := make(http.Header, 4)
@@ -206,14 +255,12 @@ func (c *rawConnState) httpRequest(req *rawRequest) *http.Request {
 	}
 }
 
-// rawResponseWriter is the minimal http.ResponseWriter the handlers use.
-// WriteHeader only records the status; Write accumulates the body. The
-// connection flushes status + headers + body together in one syscall.
 type rawResponseWriter struct {
 	hdr         http.Header
 	status      int
 	body        []byte
 	wroteHeader bool
+	cached      []byte // pre-serialized full response, set by WriteCached
 }
 
 func (rw *rawResponseWriter) Header() http.Header { return rw.hdr }
@@ -233,16 +280,21 @@ func (rw *rawResponseWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// WriteCached bypasses the adapter: the handler supplies a complete,
+// pre-serialized HTTP response which is written straight to the connection.
+func (rw *rawResponseWriter) WriteCached(full []byte) {
+	rw.cached = full
+	rw.wroteHeader = true
+}
+
 func (rw *rawResponseWriter) reset(bodyBuf []byte) {
 	clear(rw.hdr)
 	rw.status = 0
 	rw.body = bodyBuf[:0]
 	rw.wroteHeader = false
+	rw.cached = nil
 }
 
-// flush serializes the complete response into one buffer and issues exactly
-// one conn.Write. Content-Length is always provided so keep-alive clients know
-// where the body ends without waiting for connection close.
 func (c *rawConnState) flush(rw *rawResponseWriter) error {
 	status := rw.status
 	if status == 0 {
@@ -250,7 +302,7 @@ func (c *rawConnState) flush(rw *rawResponseWriter) error {
 	}
 	noBody := status == http.StatusNoContent || status == http.StatusNotModified
 
-	out := c.outbuf[:0]
+	out := c.out.b[:0]
 	out = append(out, "HTTP/1.1 "...)
 	out = strconv.AppendInt(out, int64(status), 10)
 	out = append(out, ' ')
@@ -265,25 +317,26 @@ func (c *rawConnState) flush(rw *rawResponseWriter) error {
 			out = append(out, '\r', '\n')
 		}
 	}
+	out = append(out, "Connection: keep-alive\r\n"...)
 	if !noBody {
 		out = append(out, "Content-Length: "...)
 		out = strconv.AppendInt(out, int64(len(rw.body)), 10)
 		out = append(out, '\r', '\n')
-		out = append(out, "Connection: keep-alive\r\n"...)
-	} else {
-		out = append(out, "Connection: keep-alive\r\n"...)
 	}
 	out = append(out, '\r', '\n')
 	if !noBody {
 		out = append(out, rw.body...)
 	}
-	c.outbuf = out
+	if cap(out) > cap(c.out.b) {
+		c.out.b = out
+	}
 	_, err := c.conn.Write(out)
 	return err
 }
 
 func serveRawConn(conn net.Conn, s *Server) {
 	c := newRawConnState(conn)
+	defer c.release()
 	rw := &rawResponseWriter{hdr: make(http.Header, 6)}
 	for {
 		req, err := c.nextRequest()
@@ -292,10 +345,15 @@ func serveRawConn(conn net.Conn, s *Server) {
 		}
 		// syscountRequest is invoked inside ServeHTTP, identical to baseline.
 		hreq := c.httpRequest(req)
-		rw.reset(c.wbuf)
+		rw.reset(c.body.b[:0])
 		s.ServeHTTP(rw, hreq)
-		c.wbuf = rw.body // retain any growth for reuse
-		if err := c.flush(rw); err != nil {
+		if rw.cached != nil {
+			_, err = c.conn.Write(rw.cached)
+		} else {
+			c.body.b = rw.body // retain any growth for reuse
+			err = c.flush(rw)
+		}
+		if err != nil {
 			return
 		}
 		if req.Close {

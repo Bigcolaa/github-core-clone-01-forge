@@ -32,13 +32,14 @@ type CommitInfo struct {
 
 // Issue / PR / comment models.
 type Issue struct {
-	Number int     `json:"number"`
-	Title  string  `json:"title"`
-	Body   string  `json:"body"`
-	State  string  `json:"state"`
-	Labels []Label `json:"labels"`
-	ID     string  `json:"id,omitempty"`
-	cache  atomic.Pointer[[]byte]
+	Number    int     `json:"number"`
+	Title     string  `json:"title"`
+	Body      string  `json:"body"`
+	State     string  `json:"state"`
+	Labels    []Label `json:"labels"`
+	ID        string  `json:"id,omitempty"`
+	cache     atomic.Pointer[[]byte]
+	httpCache atomic.Pointer[[]byte] // pre-serialized full HTTP GET response
 }
 
 type Label struct {
