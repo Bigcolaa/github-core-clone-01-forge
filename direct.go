@@ -128,15 +128,8 @@ func directRequest(c *rawConnState, req *rawRequest) (bool, error) {
 	case "git-receive-pack":
 		syscountRequest("POST", req.Path, req.RawQuery)
 		// The receive-pack result is freshly built, so serialize it directly.
-		report, tips := rp.handleReceivePack(req.Body)
-		err := c.writeGitFull(req, ctReceiveResult, report)
-		// Prewarm only after the response is on the wire: the timed push never
-		// pays for clone cache materialization. Coalescing keeps this to one
-		// background build even across 200 rapid pushes.
-		if err == nil {
-			rp.schedulePrewarm(tips)
-		}
-		return true, err
+		report, _ := rp.handleReceivePack(req.Body)
+		return true, c.writeGitFull(req, ctReceiveResult, report)
 	}
 	return false, nil
 }

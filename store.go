@@ -114,12 +114,6 @@ type Repo struct {
 	lsRefsCache atomic.Pointer[advertCacheEntry]
 	packCache   atomic.Pointer[packCacheEntry]
 	packGen     sync.Mutex // serializes pack generation on a cache miss only
-
-	// Prewarm coalescing: at most one background prewarm runs per repo, and it
-	// always uses the newest published tip. This keeps 200 timed pushes from
-	// spawning 200 competing pack-generation goroutines.
-	prewarmScheduled atomic.Bool
-	prewarmTip       atomic.Value // string
 }
 
 func newRepo(name, owner, desc string, private bool) *Repo {
