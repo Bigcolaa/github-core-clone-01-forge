@@ -114,6 +114,12 @@ type Repo struct {
 	lsRefsCache atomic.Pointer[advertCacheEntry]
 	packCache   atomic.Pointer[packCacheEntry]
 	packGen     sync.Mutex // serializes pack generation on a cache miss only
+
+	// Prewarm coalescing: at most one background prewarm runs per repo, and it
+	// always uses the newest published tip. This keeps 200 timed pushes from
+	// spawning 200 competing pack-generation goroutines.
+	prewarmScheduled atomic.Bool
+	prewarmTip       atomic.Value // string
 }
 
 func newRepo(name, owner, desc string, private bool) *Repo {
@@ -121,18 +127,23 @@ func newRepo(name, owner, desc string, private bool) *Repo {
 		Name: name, FullName: owner + "/" + name, Owner: owner,
 		Description: desc, Private: private, DefaultBranch: "main",
 		branches: map[string]string{}, tags: map[string]string{},
-		objects: map[string]*GitObject{}, issues: []*Issue{}, issueByN: map[int]*Issue{},
-		prs: []*Pull{}, prByN: map[int]*Pull{}, labels: map[string]string{},
+		// Pre-size the two collections grown by the timed push and write
+		// workloads so neither reallocates mid-run.
+		objects:  make(map[string]*GitObject, 512),
+		issues:   make([]*Issue, 0, 512),
+		issueByN: make(map[int]*Issue, 512),
+		prs:      []*Pull{}, prByN: map[int]*Pull{}, labels: map[string]string{},
 		comments: map[int][]*Comment{}, files: map[string]map[string]string{},
 	}
 }
 
 // Global store.
 type Store struct {
-	mu    sync.RWMutex
-	repos map[string]*Repo
-	login string
-	token string
+	mu         sync.RWMutex
+	repos      map[string]*Repo
+	login      string
+	token      string
+	authBearer string // precomputed "Bearer "+token for the create-issue fast path
 }
 
 var store = &Store{repos: map[string]*Repo{}, login: "adaiversen"}

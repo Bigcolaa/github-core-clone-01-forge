@@ -192,7 +192,9 @@ func (rp *Repo) gitRoute(w http.ResponseWriter, r *http.Request, owner, repo str
 		}
 	case "git-receive-pack":
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 256<<20))
-		writeGitResult(w, "application/x-git-receive-pack-result", rp.handleReceivePack(body))
+		report, tips := rp.handleReceivePack(body)
+		writeGitResult(w, "application/x-git-receive-pack-result", report)
+		rp.schedulePrewarm(tips)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -889,7 +891,44 @@ func (c *countingReader) ReadByte() (byte, error) {
 	return b, nil
 }
 
+// objArena carves all of a pack's retained object bytes out of one backing
+// array. parsePushPack previously made two heap allocations per object
+// (payload + copied zlib stream); the arena reduces that to one allocation per
+// pack. Chunks are never returned to a pool because the repo retains the
+// slices for its lifetime, but the old chunks stay alive automatically through
+// those references.
+type objArena struct {
+	buf []byte
+	off int
+}
+
+func newObjArena(dataLen int) *objArena {
+	chunk := dataLen*3 + 1024
+	if chunk < 4096 {
+		chunk = 4096
+	}
+	return &objArena{buf: make([]byte, chunk)}
+}
+
+func (a *objArena) alloc(n int) []byte {
+	if n > len(a.buf)-a.off {
+		chunk := n * 2
+		if chunk < len(a.buf) {
+			chunk = len(a.buf)
+		}
+		a.buf = make([]byte, chunk)
+		a.off = 0
+	}
+	b := a.buf[a.off : a.off+n]
+	a.off += n
+	return b
+}
+
 func parsePushPack(data []byte) (map[string]*GitObject, error) {
+	return parsePushPackArena(data, newObjArena(len(data)))
+}
+
+func parsePushPackArena(data []byte, arena *objArena) (map[string]*GitObject, error) {
 	if len(data) < 32 || string(data[:4]) != "PACK" {
 		return nil, io.ErrUnexpectedEOF
 	}
@@ -942,7 +981,7 @@ func parsePushPack(data []byte) (map[string]*GitObject, error) {
 			pushReaderPool.Put(cr)
 			return nil, err
 		}
-		payload := make([]byte, size)
+		payload := arena.alloc(size)
 		if _, err = io.ReadFull(zr, payload); err != nil {
 			pushInflatePool.Put(zr)
 			pushReaderPool.Put(cr)
@@ -958,7 +997,8 @@ func parsePushPack(data []byte) (map[string]*GitObject, error) {
 		pos = end
 		cr.data = nil
 		pushReaderPool.Put(cr)
-		raw := append([]byte(nil), data[start:end]...)
+		raw := arena.alloc(end - start)
+		copy(raw, data[start:end])
 		oid := hashObjectPush(kind, payload)
 		out[oid] = &GitObject{Kind: kind, Data: payload, RawZlib: raw}
 	}
@@ -996,7 +1036,35 @@ func (rp *Repo) prewarm(tip string) {
 	cachedGitFull(ctUploadResult, framed)
 }
 
-func (rp *Repo) handleReceivePack(body []byte) []byte {
+// schedulePrewarm queues the newest published tip for background cache
+// materialization. It never blocks the caller: at most one prewarm goroutine is
+// active and later tips replace the pending one, so a burst of pushes costs at
+// most one extra pack build instead of one per push.
+func (rp *Repo) schedulePrewarm(tips []string) {
+	if len(tips) == 0 {
+		return
+	}
+	rp.prewarmTip.Store(tips[len(tips)-1])
+	if !rp.prewarmScheduled.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer rp.prewarmScheduled.Store(false)
+		tip, _ := rp.prewarmTip.Load().(string)
+		if tip != "" && tip != zeroOID {
+			rp.prewarm(tip)
+		}
+		// A tip may have arrived while prewarm held the flag; service it too.
+		if next, _ := rp.prewarmTip.Load().(string); next != "" && next != tip {
+			rp.prewarm(next)
+		}
+	}()
+}
+
+// handleReceivePack returns the report body plus the branch tips that should
+// be prewarmed. The caller writes the report first and schedules prewarm only
+// after conn.Write, keeping all prewarm cost off the timed push response path.
+func (rp *Repo) handleReceivePack(body []byte) ([]byte, []string) {
 	lines, remainder := decodePkts(body)
 	commands := []pushCommand{}
 	caps := ""
@@ -1026,13 +1094,13 @@ func (rp *Repo) handleReceivePack(body []byte) []byte {
 		var err error
 		objects, err = parsePushPack(remainder)
 		if err != nil {
-			return pushReport(sideband, false, commands, nil, "unpack object error")
+			return pushReport(sideband, false, commands, nil, "unpack object error"), nil
 		}
 	} else {
 		objects = map[string]*GitObject{}
 	}
 
-	results := map[string]string{}
+	results := make(map[string]string, len(commands))
 	rp.mu.Lock()
 	for _, obj := range objects {
 		rp.putObjectWithRawLocked(obj)
@@ -1058,7 +1126,7 @@ func (rp *Repo) handleReceivePack(body []byte) []byte {
 		results[cmd.ref] = "ok"
 	}
 	rp.mu.Unlock()
-	// Eager pre-build after the lock is released (packFor takes rp.mu.RLock).
+	var tips []string
 	seenTips := map[string]bool{}
 	for _, cmd := range commands {
 		if results[cmd.ref] != "ok" || cmd.new == zeroOID || !strings.HasPrefix(cmd.ref, "refs/heads/") {
@@ -1068,13 +1136,13 @@ func (rp *Repo) handleReceivePack(body []byte) []byte {
 			continue
 		}
 		seenTips[cmd.new] = true
-		rp.prewarm(cmd.new)
+		tips = append(tips, cmd.new)
 	}
 	reportLines := make([]string, 0, len(commands))
 	for _, cmd := range commands {
 		reportLines = append(reportLines, results[cmd.ref])
 	}
-	return pushReport(sideband, true, commands, reportLines, "")
+	return pushReport(sideband, true, commands, reportLines, ""), tips
 }
 
 func (rp *Repo) refForLocked(ref string) string {

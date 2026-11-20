@@ -57,6 +57,7 @@ func main() {
 	}
 	envURL = strings.TrimRight(envURL, "/")
 	store.token = os.Getenv("MAKEFUN_SHOP_TOKEN")
+	store.authBearer = "Bearer " + store.token
 
 	ln, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {

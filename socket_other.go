@@ -11,5 +11,3 @@ func tuneConn(conn net.Conn) {
 		_ = nd.SetNoDelay(true)
 	}
 }
-
-func rearmQuickAck(conn net.Conn) {}

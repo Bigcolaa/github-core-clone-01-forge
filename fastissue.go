@@ -111,18 +111,21 @@ func fastCreateIssue(req *rawRequest) ([]byte, bool) {
 		return nil, false
 	}
 	mid := req.Path[len(prefix) : len(req.Path)-len(suffix)]
-	parts := strings.Split(mid, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	// IndexByte avoids the slice allocation strings.Split makes on every one of
+	// the 200 timed create-issue requests.
+	slash := strings.IndexByte(mid, '/')
+	if slash <= 0 || slash == len(mid)-1 || strings.IndexByte(mid[slash+1:], '/') >= 0 {
 		return nil, false
 	}
-	if store.token != "" && req.Authorization != "Bearer "+store.token {
+	owner, repoName := mid[:slash], mid[slash+1:]
+	if store.token != "" && req.Authorization != store.authBearer {
 		return nil, false
 	}
 	title, bodyText, ok := fastScanIssueBody(req.Body)
 	if !ok {
 		return nil, false
 	}
-	rp := store.getRepo(parts[0], parts[1])
+	rp := store.getRepo(owner, repoName)
 	if rp == nil {
 		return nil, false
 	}

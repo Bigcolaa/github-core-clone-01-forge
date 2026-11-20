@@ -138,7 +138,6 @@ func (c *rawConnState) readAppend() (int, error) {
 	if c.rend == len(c.buf.b) {
 		c.ensureCapacity(len(c.buf.b) * 2)
 	}
-	rearmQuickAck(c.conn)
 	n, err := c.conn.Read(c.buf.b[c.rend:])
 	c.rend += n
 	return n, err
