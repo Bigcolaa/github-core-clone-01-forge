@@ -17,6 +17,7 @@ import (
 type Server struct{}
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	syscountRequest(r.Method, r.URL.Path, r.URL.RawQuery)
 	switch {
 	case r.URL.Path == "/healthz":
 		writeJSON(w, 200, map[string]any{"ok": true})
@@ -62,6 +63,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	ln = instrumentListener(ln)
 	port := ln.Addr().(*net.TCPAddr).Port
 	srv := &http.Server{
 		Handler:           &Server{},
@@ -102,5 +104,6 @@ func main() {
 		time.Sleep(25 * time.Millisecond)
 	}
 	_ = srv.Close()
+	dumpSyscounts()
 	os.Exit(0)
 }

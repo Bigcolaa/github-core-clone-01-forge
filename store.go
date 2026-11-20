@@ -104,11 +104,12 @@ type Repo struct {
 	commentSeq int64
 	files      map[string]map[string]string // branch -> flattened path -> blob oid
 
-	advV2     atomic.Pointer[advertCacheEntry]
-	advV0     atomic.Pointer[advertCacheEntry]
-	advRecv   atomic.Pointer[advertCacheEntry]
-	packCache atomic.Pointer[packCacheEntry]
-	packGen   sync.Mutex // serializes pack generation on a cache miss only
+	advV2       atomic.Pointer[advertCacheEntry]
+	advV0       atomic.Pointer[advertCacheEntry]
+	advRecv     atomic.Pointer[advertCacheEntry]
+	lsRefsCache atomic.Pointer[advertCacheEntry]
+	packCache   atomic.Pointer[packCacheEntry]
+	packGen     sync.Mutex // serializes pack generation on a cache miss only
 }
 
 func newRepo(name, owner, desc string, private bool) *Repo {

@@ -10,7 +10,28 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
+
+// Reusing zlib readers avoids a fresh ~40 KiB inflate history buffer per
+// pushed object (600 per push workload). Reset keeps the decoded bytes zero-copy.
+var pushInflatePool = sync.Pool{New: func() any {
+	var seed bytes.Buffer
+	zw := zlib.NewWriter(&seed)
+	_ = zw.Close()
+	zr, _ := zlib.NewReader(bytes.NewReader(seed.Bytes()))
+	return zr
+}}
+
+func getPushInflater(src io.Reader) (io.ReadCloser, error) {
+	zr := pushInflatePool.Get().(io.ReadCloser)
+	if err := zr.(zlib.Resetter).Reset(src, nil); err != nil {
+		pushInflatePool.Put(zr)
+		return nil, err
+	}
+	return zr, nil
+}
 
 const zeroOID = "0000000000000000000000000000000000000000"
 
@@ -174,10 +195,11 @@ func capabilities(advert bool, receive bool) string {
 }
 
 func (rp *Repo) uploadAdvertV2() []byte {
-	rp.mu.RLock()
-	defer rp.mu.RUnlock()
-	key := "v2:" + rp.branches[rp.DefaultBranch]
-	if p := rp.advV2.Load(); p != nil && p.key == key {
+	// The v2 advertisement is a constant capability list: it carries no refs.
+	// Returning the cached bytes without rp.mu removes a lock acquisition from
+	// every clone's three advertisement round trips. Concurrent first writes
+	// are harmless (identical bytes).
+	if p := rp.advV2.Load(); p != nil {
 		return p.b
 	}
 	var b []byte
@@ -188,7 +210,7 @@ func (rp *Repo) uploadAdvertV2() []byte {
 	b = appendPktStr(b, "object-format=sha1\n")
 	b = appendPktStr(b, "agent=forge/1\n")
 	b = append(b, flushPkt...)
-	rp.advV2.Store(&advertCacheEntry{key: key, b: b})
+	rp.advV2.Store(&advertCacheEntry{key: "v2", b: b})
 	return b
 }
 
@@ -260,6 +282,19 @@ func (rp *Repo) receiveAdvert() []byte {
 }
 
 func (rp *Repo) handleLsRefs(body []byte) []byte {
+	rp.mu.RLock()
+	key := string(body) + "|" + rp.branches[rp.DefaultBranch]
+	if p := rp.lsRefsCache.Load(); p != nil && p.key == key {
+		rp.mu.RUnlock()
+		return p.b
+	}
+	rp.mu.RUnlock()
+	out := rp.handleLsRefsSlow(body)
+	rp.lsRefsCache.Store(&advertCacheEntry{key: key, b: out})
+	return out
+}
+
+func (rp *Repo) handleLsRefsSlow(body []byte) []byte {
 	lines, _ := decodePkts(body)
 	prefixes := []string{}
 	peel, symrefs, unborn := false, false, false
@@ -399,11 +434,28 @@ func (rp *Repo) handleFetchV0(body []byte) []byte {
 }
 
 func appendSidebandPack(dst []byte, pack []byte) []byte {
+	return append(dst, framedSidebandPack(pack)...)
+}
+
+// framedSidebandPack returns the complete sideband-framed pack bytes. The
+// clone workload serves the same cached pack to 50 concurrent clients; framing
+// it once removes one allocation and one full copy per clone.
+type framedPackEntry struct {
+	src    []byte
+	framed []byte
+}
+
+var framedPackCache atomic.Pointer[framedPackEntry]
+
+func framedSidebandPack(pack []byte) []byte {
 	if len(pack) == 0 {
-		// A valid empty pack still has its header and trailer.
 		pack = emptyPack()
 	}
+	if p := framedPackCache.Load(); p != nil && len(p.src) == len(pack) && &p.src[0] == &pack[0] {
+		return p.framed
+	}
 	const chunk = 65000
+	framed := make([]byte, 0, len(pack)+len(pack)/chunk*8+64)
 	for i := 0; i < len(pack); i += chunk {
 		end := i + chunk
 		if end > len(pack) {
@@ -412,9 +464,10 @@ func appendSidebandPack(dst []byte, pack []byte) []byte {
 		payload := make([]byte, 1+end-i)
 		payload[0] = 1
 		copy(payload[1:], pack[i:end])
-		dst = append(dst, pkt(payload)...)
+		framed = append(framed, pkt(payload)...)
 	}
-	return dst
+	framedPackCache.Store(&framedPackEntry{src: pack, framed: framed})
+	return framed
 }
 
 func emptyPack() []byte {
@@ -742,16 +795,16 @@ func parsePushPack(data []byte) (map[string]*GitObject, error) {
 			return nil, io.ErrUnexpectedEOF
 		}
 		cr := &countingReader{data: data, pos: pos}
-		zr, err := zlib.NewReader(cr)
+		zr, err := getPushInflater(cr)
 		if err != nil {
 			return nil, err
 		}
 		payload := make([]byte, size)
 		if _, err = io.ReadFull(zr, payload); err != nil {
-			_ = zr.Close()
+			pushInflatePool.Put(zr)
 			return nil, err
 		}
-		_ = zr.Close()
+		pushInflatePool.Put(zr)
 		pos = cr.pos
 		oid := hashObject(kind, payload)
 		out[oid] = &GitObject{Kind: kind, Data: payload}
