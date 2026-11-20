@@ -801,8 +801,8 @@ func (rp *Repo) handleReceivePack(body []byte) []byte {
 
 	results := map[string]string{}
 	rp.mu.Lock()
-	for _, obj := range objects {
-		rp.putObjectLocked(obj.Kind, obj.Data)
+	for oid, obj := range objects {
+		rp.putObjectWithOIDLocked(obj.Kind, obj.Data, oid)
 	}
 	for _, cmd := range commands {
 		cur := rp.refForLocked(cmd.ref)

@@ -45,7 +45,7 @@ func authOK(r *http.Request) bool {
 	if store.token == "" {
 		return true
 	}
-	return r.Header.Get("Authorization") == "Bearer "+store.token
+	return r.Header.Get("Authorization") == store.authBearer
 }
 
 func pathParts(p string) []string {
