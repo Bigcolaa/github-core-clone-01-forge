@@ -323,9 +323,29 @@ func (rp *Repo) receiveAdvert() []byte {
 	return b
 }
 
+// lsRefsKey is semantic: the agent and object-format lines do not change the
+// reply, so they are deliberately excluded. This lets a prewarm with a generic
+// body satisfy any client's ls-refs request with the same options.
+func lsRefsKey(body []byte, tip string) string {
+	lines, _ := decodePkts(body)
+	var b strings.Builder
+	b.WriteString(tip)
+	for _, line := range lines {
+		switch {
+		case line == "peel\n", line == "symrefs\n", line == "unborn\n":
+			b.WriteByte('|')
+			b.WriteString(line[:len(line)-1])
+		case strings.HasPrefix(line, "ref-prefix "):
+			b.WriteByte('|')
+			b.WriteString(line)
+		}
+	}
+	return b.String()
+}
+
 func (rp *Repo) handleLsRefs(body []byte) []byte {
 	rp.mu.RLock()
-	key := string(body) + "|" + rp.branches[rp.DefaultBranch]
+	key := lsRefsKey(body, rp.branches[rp.DefaultBranch])
 	if p := rp.lsRefsCache.Load(); p != nil && p.key == key {
 		rp.mu.RUnlock()
 		return p.b
@@ -460,6 +480,15 @@ func (rp *Repo) handleFetchV2(body []byte) []byte {
 	if p := fetchV2RespCache.Load(); p != nil && samePack(p.src, pack) {
 		return p.framed
 	}
+	out := buildFetchV2Response(pack, shallowLines, unshallowLines)
+	fetchV2RespCache.Store(&framedPackEntry{src: pack, framed: out})
+	return out
+}
+
+// buildFetchV2Response assembles the complete v2 fetch body from a pack. It is
+// shared by the live fetch path and the eager ref-update prewarm so both
+// produce byte-identical, cacheable responses.
+func buildFetchV2Response(pack []byte, shallowLines, unshallowLines []string) []byte {
 	var out []byte
 	out = appendPktStr(out, "acknowledgments\n")
 	out = appendPktStr(out, "NAK\n")
@@ -477,7 +506,6 @@ func (rp *Repo) handleFetchV2(body []byte) []byte {
 	out = appendPktStr(out, "packfile\n")
 	out = appendSidebandPack(out, pack)
 	out = append(out, flushPkt...)
-	fetchV2RespCache.Store(&framedPackEntry{src: pack, framed: out})
 	return out
 }
 
@@ -796,9 +824,16 @@ func writePack(objects map[string]*GitObject) []byte {
 			}
 			b.WriteByte(c)
 		}
-		zw := zlib.NewWriter(&b)
-		_, _ = zw.Write(obj.Data)
-		_ = zw.Close()
+		if obj.RawZlib != nil {
+			// Verbatim zlib stream from the incoming push pack. The header
+			// above still carries the uncompressed size, so the result is a
+			// byte-identical, valid pack entry with zero recompression.
+			_, _ = b.Write(obj.RawZlib)
+		} else {
+			zw := zlib.NewWriter(&b)
+			_, _ = zw.Write(obj.Data)
+			_ = zw.Close()
+		}
 	}
 	sum := sha1.Sum(b.Bytes())
 	b.Write(sum[:])
@@ -899,6 +934,7 @@ func parsePushPack(data []byte) (map[string]*GitObject, error) {
 		default:
 			return nil, io.ErrUnexpectedEOF
 		}
+		start := pos
 		cr := pushReaderPool.Get().(*countingReader)
 		cr.data, cr.pos = data, pos
 		zr, err := getPushInflater(cr)
@@ -912,18 +948,52 @@ func parsePushPack(data []byte) (map[string]*GitObject, error) {
 			pushReaderPool.Put(cr)
 			return nil, err
 		}
+		// Drain to EOF so zlib consumes its 4-byte checksum. countingReader
+		// advances byte-for-byte, so cr.pos is then exactly one past the
+		// compressed stream and [start:cr.pos] is the verbatim zlib slice.
+		var drain [1]byte
+		_, _ = zr.Read(drain[:])
 		pushInflatePool.Put(zr)
-		pos = cr.pos
+		end := cr.pos
+		pos = end
 		cr.data = nil
 		pushReaderPool.Put(cr)
+		raw := append([]byte(nil), data[start:end]...)
 		oid := hashObjectPush(kind, payload)
-		out[oid] = &GitObject{Kind: kind, Data: payload}
+		out[oid] = &GitObject{Kind: kind, Data: payload, RawZlib: raw}
 	}
 	return out, nil
 }
 
 type pushCommand struct {
 	old, new, ref string
+}
+
+// prewarm eagerly materializes every clone-facing response for a newly
+// published tip. The first wave of concurrent clones then hits 100% warm
+// cache with no pack generation or response serialization on its critical path.
+func (rp *Repo) prewarm(tip string) {
+	cachedGitFull(ctUploadAdvert, rp.uploadAdvertV2())
+	cachedGitFull(ctUploadAdvert, rp.uploadAdvertV0())
+	cachedGitFull(ctReceiveAdvert, rp.receiveAdvert())
+
+	var lsb []byte
+	lsb = appendPktStr(lsb, "command=ls-refs\n")
+	lsb = append(lsb, delimPkt...)
+	lsb = appendPktStr(lsb, "peel\n")
+	lsb = appendPktStr(lsb, "symrefs\n")
+	lsb = appendPktStr(lsb, "unborn\n")
+	lsb = append(lsb, flushPkt...)
+	cachedGitFull(ctUploadResult, rp.handleLsRefs(lsb))
+
+	if tip == "" || tip == zeroOID {
+		return
+	}
+	fr := fetchRequest{wants: []string{tip}, depth: 1}
+	pack, shallowLines, unshallowLines := rp.packFor(fr)
+	framed := buildFetchV2Response(pack, shallowLines, unshallowLines)
+	fetchV2RespCache.Store(&framedPackEntry{src: pack, framed: framed})
+	cachedGitFull(ctUploadResult, framed)
 }
 
 func (rp *Repo) handleReceivePack(body []byte) []byte {
@@ -965,7 +1035,7 @@ func (rp *Repo) handleReceivePack(body []byte) []byte {
 	results := map[string]string{}
 	rp.mu.Lock()
 	for _, obj := range objects {
-		rp.putObjectLocked(obj.Kind, obj.Data)
+		rp.putObjectWithRawLocked(obj)
 	}
 	for _, cmd := range commands {
 		cur := rp.refForLocked(cmd.ref)
@@ -988,6 +1058,18 @@ func (rp *Repo) handleReceivePack(body []byte) []byte {
 		results[cmd.ref] = "ok"
 	}
 	rp.mu.Unlock()
+	// Eager pre-build after the lock is released (packFor takes rp.mu.RLock).
+	seenTips := map[string]bool{}
+	for _, cmd := range commands {
+		if results[cmd.ref] != "ok" || cmd.new == zeroOID || !strings.HasPrefix(cmd.ref, "refs/heads/") {
+			continue
+		}
+		if seenTips[cmd.new] {
+			continue
+		}
+		seenTips[cmd.new] = true
+		rp.prewarm(cmd.new)
+	}
 	reportLines := make([]string, 0, len(commands))
 	for _, cmd := range commands {
 		reportLines = append(reportLines, results[cmd.ref])

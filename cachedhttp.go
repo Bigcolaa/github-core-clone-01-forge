@@ -30,7 +30,7 @@ func writeCachedResponse(w http.ResponseWriter, full []byte) bool {
 	return true
 }
 
-const cachedRequestID = "forge-cache"
+const cachedRequestID = "1"
 
 func fullHTTPResponse(status int, contentType string, withRequestID bool, body []byte) []byte {
 	id := ""
@@ -62,7 +62,7 @@ func fullHTTPResponseID(status int, contentType, reqID string, body []byte) []by
 	out = append(out, "Content-Length: "...)
 	out = strconv.AppendInt(out, int64(len(body)), 10)
 	out = append(out, "\r\n"...)
-	out = append(out, "Connection: keep-alive\r\n\r\n"...)
+	out = append(out, '\r', '\n') // HTTP/1.1 connections are persistent by default
 	out = append(out, body...)
 	return out
 }

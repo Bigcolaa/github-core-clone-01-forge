@@ -14,6 +14,9 @@ import (
 type GitObject struct {
 	Kind string
 	Data []byte
+	// RawZlib is the exact zlib stream this object arrived with in a push pack.
+	// When present, writePack splices it verbatim instead of recompressing.
+	RawZlib []byte
 }
 
 // TreeEnt is one entry of a git tree.
@@ -213,6 +216,16 @@ func (r *Repo) putObjectLocked(kind string, data []byte) string {
 	oid := hashObject(kind, data)
 	if _, ok := r.objects[oid]; !ok {
 		r.objects[oid] = &GitObject{Kind: kind, Data: append([]byte(nil), data...)}
+	}
+	return oid
+}
+
+// putObjectWithRawLocked stores an object preserving its original zlib stream
+// so a later pack can be assembled without recompression.
+func (r *Repo) putObjectWithRawLocked(obj *GitObject) string {
+	oid := hashObjectPush(obj.Kind, obj.Data)
+	if _, ok := r.objects[oid]; !ok {
+		r.objects[oid] = obj
 	}
 	return oid
 }

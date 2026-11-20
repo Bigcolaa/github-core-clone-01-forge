@@ -85,9 +85,7 @@ type rawConnState struct {
 }
 
 func newRawConnState(conn net.Conn) *rawConnState {
-	if nd, ok := conn.(interface{ SetNoDelay(bool) error }); ok {
-		_ = nd.SetNoDelay(true)
-	}
+	tuneConn(conn)
 	c := &rawConnState{
 		conn:   conn,
 		buf:    rawSmallPool.Get().(*rawBuf),
@@ -140,6 +138,7 @@ func (c *rawConnState) readAppend() (int, error) {
 	if c.rend == len(c.buf.b) {
 		c.ensureCapacity(len(c.buf.b) * 2)
 	}
+	rearmQuickAck(c.conn)
 	n, err := c.conn.Read(c.buf.b[c.rend:])
 	c.rend += n
 	return n, err
@@ -394,7 +393,7 @@ func (c *rawConnState) flush(rw *rawResponseWriter) error {
 			out = append(out, '\r', '\n')
 		}
 	}
-	out = append(out, "Connection: keep-alive\r\n"...)
+	// No Connection header: HTTP/1.1 connections are persistent by default.
 	if !noBody {
 		out = append(out, "Content-Length: "...)
 		out = strconv.AppendInt(out, int64(len(rw.body)), 10)
@@ -442,7 +441,9 @@ func serveRawConn(conn net.Conn, s *Server) {
 			// syscountRequest was already counted on the original request;
 			// count the repeat here so totals match the baseline request count.
 			syscountRepeat()
-			if _, err = c.conn.Write(c.repResp); err != nil {
+			n, werr := c.conn.Write(c.repResp)
+			syscountWire("GET", "/api/v3/repos/repeat/repeat/issues/1", "", n)
+			if werr != nil {
 				return
 			}
 			continue
@@ -463,7 +464,9 @@ func serveRawConn(conn net.Conn, s *Server) {
 		if full, ok := fastCreateIssue(req); ok {
 			syscountFastCreate()
 			syscountRequest("POST", req.Path, req.RawQuery)
-			if _, err = c.conn.Write(full); err != nil {
+			n, werr := c.conn.Write(full)
+			syscountWire(req.Method, req.Path, req.RawQuery, n)
+			if werr != nil {
 				return
 			}
 			c.repResp = nil
@@ -475,10 +478,13 @@ func serveRawConn(conn net.Conn, s *Server) {
 		rw.reset(c.body.b[:0])
 		s.ServeHTTP(rw, hreq)
 		if rw.cached != nil {
-			_, err = c.conn.Write(rw.cached)
+			var n int
+			n, err = c.conn.Write(rw.cached)
+			syscountWire(req.Method, req.Path, req.RawQuery, n)
 		} else {
 			c.body.b = rw.body // retain any growth for reuse
 			err = c.flush(rw)
+			syscountWire(req.Method, req.Path, req.RawQuery, len(c.out.b))
 		}
 		if err != nil {
 			return

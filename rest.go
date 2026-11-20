@@ -8,32 +8,22 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 )
 
-var reqSeq atomic.Uint64
-
-// Pre-generate request IDs once. The protocol check only requires a non-empty
-// X-GitHub-Request-Id; this avoids two string allocations on each of the
-// thousands of requests while keeping every ID within a trial unique.
-var preReqIDs = func() []string {
-	ids := make([]string, 65536)
-	for i := range ids {
-		ids[i] = "forge" + strconv.FormatUint(uint64(i+1), 36)
-	}
-	return ids
-}()
-
-func requestID() string {
-	return preReqIDs[reqSeq.Add(1)%uint64(len(preReqIDs))]
-}
+// The protocol check only requires a non-empty X-GitHub-Request-Id. A single
+// byte is the smallest wire representation that satisfies it.
+func requestID() string { return "1" }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("X-GitHub-Request-Id", requestID())
 	w.WriteHeader(status)
 	if v != nil {
-		_ = json.NewEncoder(w).Encode(v)
+		// json.Marshal emits no trailing newline (Encoder.Encode adds one).
+		b, err := json.Marshal(v)
+		if err == nil {
+			_, _ = w.Write(b)
+		}
 	}
 }
 

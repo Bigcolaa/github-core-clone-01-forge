@@ -20,16 +20,17 @@ const (
 
 // writeGitFull serializes status + headers + body into the reusable output
 // buffer and writes it with one conn.Write.
-func (c *rawConnState) writeGitFull(contentType string, body []byte) error {
+func (c *rawConnState) writeGitFull(req *rawRequest, contentType string, body []byte) error {
 	out := c.out.b[:0]
 	out = append(out, "HTTP/1.1 200 OK\r\nContent-Type: "...)
 	out = append(out, contentType...)
 	out = append(out, "\r\nContent-Length: "...)
 	out = strconv.AppendInt(out, int64(len(body)), 10)
-	out = append(out, "\r\nConnection: keep-alive\r\n\r\n"...)
+	out = append(out, "\r\n\r\n"...)
 	out = append(out, body...)
 	c.out.b = out
-	_, err := c.conn.Write(out)
+	n, err := c.conn.Write(out)
+	syscountWire(req.Method, req.Path, req.RawQuery, n)
 	return err
 }
 
@@ -49,12 +50,13 @@ func cachedGitFull(contentType string, body []byte) []byte {
 	return actual.([]byte)
 }
 
-func (c *rawConnState) writeGitCached(contentType string, body []byte) error {
+func (c *rawConnState) writeGitCached(req *rawRequest, contentType string, body []byte) error {
 	if full := cachedGitFull(contentType, body); full != nil {
-		_, err := c.conn.Write(full)
+		n, err := c.conn.Write(full)
+		syscountWire(req.Method, req.Path, req.RawQuery, n)
 		return err
 	}
-	return c.writeGitFull(contentType, body)
+	return c.writeGitFull(req, contentType, body)
 }
 
 // directRequest dispatches git info/refs, upload-pack, receive-pack, and
@@ -102,10 +104,10 @@ func directRequest(c *rawConnState, req *rawRequest) (bool, error) {
 			} else {
 				body = rp.uploadAdvertV0()
 			}
-			return true, c.writeGitCached(ctUploadAdvert, body)
+			return true, c.writeGitCached(req, ctUploadAdvert, body)
 		case strings.Contains(req.RawQuery, "service=git-receive-pack"):
 			syscountRequest("GET", req.Path, req.RawQuery)
-			return true, c.writeGitCached(ctReceiveAdvert, rp.receiveAdvert())
+			return true, c.writeGitCached(req, ctReceiveAdvert, rp.receiveAdvert())
 		}
 		return false, nil
 	}
@@ -122,11 +124,11 @@ func directRequest(c *rawConnState, req *rawRequest) (bool, error) {
 		} else {
 			body = rp.handleFetchV0(req.Body)
 		}
-		return true, c.writeGitCached(ctUploadResult, body)
+		return true, c.writeGitCached(req, ctUploadResult, body)
 	case "git-receive-pack":
 		syscountRequest("POST", req.Path, req.RawQuery)
 		// The receive-pack result is freshly built, so serialize it directly.
-		return true, c.writeGitFull(ctReceiveResult, rp.handleReceivePack(req.Body))
+		return true, c.writeGitFull(req, ctReceiveResult, rp.handleReceivePack(req.Body))
 	}
 	return false, nil
 }

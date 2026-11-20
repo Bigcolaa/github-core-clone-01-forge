@@ -13,4 +13,5 @@ func syscountRepeatArmed()                            {}
 func syscountRepeatTry()                              {}
 func syscountRepeatInvalid(reason string)             {}
 func syscountFastCreate()                             {}
+func syscountWire(method, path, query string, n int)  {}
 func dumpSyscounts()                                  {}

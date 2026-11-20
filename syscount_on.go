@@ -21,6 +21,7 @@ var (
 	scWrites        atomic.Int64
 	scReadBytes     atomic.Int64
 	scWriteBytes    atomic.Int64
+	scCatBytes      sync.Map // category -> *atomic.Int64 (server-to-client wire bytes)
 	scConns         atomic.Int64
 	scReqPush       atomic.Int64
 	scReqClone      atomic.Int64
@@ -51,6 +52,9 @@ func syscountRepeat() {
 }
 
 type scConn struct{ net.Conn }
+
+// Unwrap lets platform socket tuners reach the underlying *net.TCPConn.
+func (c *scConn) Unwrap() net.Conn { return c.Conn }
 
 func (c *scConn) SetNoDelay(noDelay bool) error {
 	if tc, ok := c.Conn.(*net.TCPConn); ok {
@@ -86,37 +90,56 @@ func (l *scListener) Accept() (net.Conn, error) {
 
 func instrumentListener(ln net.Listener) net.Listener { return &scListener{Listener: ln} }
 
-func syscountRequest(method, path, query string) {
-	scReqTotal.Add(1)
-	key := "other"
+func scCategory(method, path, query string) string {
 	switch {
 	case strings.Contains(path, "/api/v3"):
 		if method == "POST" && strings.HasSuffix(path, "/issues") {
-			scReqWrite.Add(1)
-			key = "write"
-		} else if method == "GET" && strings.Contains(path, "/issues/") {
-			scReqRead.Add(1)
-			key = "read"
-		} else {
-			scReqOther.Add(1)
+			return "write"
+		}
+		if method == "GET" && strings.Contains(path, "/issues/") {
+			return "read"
 		}
 	case strings.Contains(path, ".git"):
 		if method == "POST" && strings.HasSuffix(path, "/git-receive-pack") {
-			scReqPush.Add(1)
-			key = "push"
-		} else if strings.Contains(query, "service=git-receive-pack") {
-			scReqPush.Add(1)
-			key = "push"
-		} else {
-			scReqClone.Add(1)
-			key = "clone"
+			return "push"
 		}
+		if strings.Contains(query, "service=git-receive-pack") {
+			return "push"
+		}
+		return "clone"
+	}
+	return "other"
+}
+
+func syscountRequest(method, path, query string) {
+	scReqTotal.Add(1)
+	key := scCategory(method, path, query)
+	switch key {
+	case "write":
+		scReqWrite.Add(1)
+	case "read":
+		scReqRead.Add(1)
+	case "push":
+		scReqPush.Add(1)
+	case "clone":
+		scReqClone.Add(1)
 	default:
 		scReqOther.Add(1)
 	}
 	v, _ := scPathCounts.LoadOrStore(key, &atomic.Int64{})
 	v.(*atomic.Int64).Add(1)
 	_ = http.MethodGet // keep net/http import stable across builds
+}
+
+// syscountWire attributes every server-to-client byte to the workload that
+// requested it, so the A/B can report total wire bytes per workload.
+func syscountWire(method, path, query string, n int) {
+	if n <= 0 {
+		return
+	}
+	key := scCategory(method, path, query)
+	v, _ := scCatBytes.LoadOrStore(key, &atomic.Int64{})
+	v.(*atomic.Int64).Add(int64(n))
 }
 
 func dumpSyscounts() {
@@ -152,6 +175,11 @@ func dumpSyscounts() {
 			return m
 		}(),
 		"requests_by_category": byKey,
+		"wire_bytes_by_category": func() map[string]int64 {
+			m := map[string]int64{}
+			scCatBytes.Range(func(k, v any) bool { m[k.(string)] = v.(*atomic.Int64).Load(); return true })
+			return m
+		}(),
 	}
 	b, _ := json.Marshal(out)
 	_ = os.WriteFile(path, b, 0o644)
