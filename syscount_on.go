@@ -17,22 +17,38 @@ import (
 )
 
 var (
-	scReads      atomic.Int64
-	scWrites     atomic.Int64
-	scReadBytes  atomic.Int64
-	scWriteBytes atomic.Int64
-	scConns      atomic.Int64
-	scReqPush    atomic.Int64
-	scReqClone   atomic.Int64
-	scReqRead    atomic.Int64
-	scReqWrite   atomic.Int64
-	scReqOther   atomic.Int64
-	scReqTotal   atomic.Int64
-	scCachedHits atomic.Int64
-	scPathCounts sync.Map // string -> *atomic.Int64
+	scReads         atomic.Int64
+	scWrites        atomic.Int64
+	scReadBytes     atomic.Int64
+	scWriteBytes    atomic.Int64
+	scConns         atomic.Int64
+	scReqPush       atomic.Int64
+	scReqClone      atomic.Int64
+	scReqRead       atomic.Int64
+	scReqWrite      atomic.Int64
+	scReqOther      atomic.Int64
+	scReqTotal      atomic.Int64
+	scCachedHits    atomic.Int64
+	scRepeatHits    atomic.Int64
+	scRepeatArmed   atomic.Int64
+	scRepeatTry     atomic.Int64
+	scFastCreate    atomic.Int64
+	scRepeatInvalid sync.Map // string -> *atomic.Int64
+	scPathCounts    sync.Map // string -> *atomic.Int64
 )
 
-func syscountCachedHit() { scCachedHits.Add(1) }
+func syscountCachedHit()   { scCachedHits.Add(1) }
+func syscountRepeatArmed() { scRepeatArmed.Add(1) }
+func syscountRepeatTry()   { scRepeatTry.Add(1) }
+func syscountFastCreate()  { scFastCreate.Add(1) }
+func syscountRepeatInvalid(reason string) {
+	v, _ := scRepeatInvalid.LoadOrStore(reason, &atomic.Int64{})
+	v.(*atomic.Int64).Add(1)
+}
+func syscountRepeat() {
+	scRepeatHits.Add(1)
+	syscountRequest("GET", "/api/v3/repos/repeat/repeat/issues/1", "")
+}
 
 type scConn struct{ net.Conn }
 
@@ -114,18 +130,27 @@ func dumpSyscounts() {
 		return true
 	})
 	out := map[string]any{
-		"conn_read_syscalls":   scReads.Load(),
-		"conn_write_syscalls":  scWrites.Load(),
-		"conn_read_bytes":      scReadBytes.Load(),
-		"conn_write_bytes":     scWriteBytes.Load(),
-		"connections":          scConns.Load(),
-		"requests_total":       scReqTotal.Load(),
-		"requests_push":        scReqPush.Load(),
-		"requests_clone":       scReqClone.Load(),
-		"requests_read":        scReqRead.Load(),
-		"requests_write":       scReqWrite.Load(),
-		"requests_other":       scReqOther.Load(),
-		"cached_write_hits":    scCachedHits.Load(),
+		"conn_read_syscalls":  scReads.Load(),
+		"conn_write_syscalls": scWrites.Load(),
+		"conn_read_bytes":     scReadBytes.Load(),
+		"conn_write_bytes":    scWriteBytes.Load(),
+		"connections":         scConns.Load(),
+		"requests_total":      scReqTotal.Load(),
+		"requests_push":       scReqPush.Load(),
+		"requests_clone":      scReqClone.Load(),
+		"requests_read":       scReqRead.Load(),
+		"requests_write":      scReqWrite.Load(),
+		"requests_other":      scReqOther.Load(),
+		"cached_write_hits":   scCachedHits.Load(),
+		"fast_create_hits":    scFastCreate.Load(),
+		"repeat_fast_hits":    scRepeatHits.Load(),
+		"repeat_armed":        scRepeatArmed.Load(),
+		"repeat_try":          scRepeatTry.Load(),
+		"repeat_invalid": func() map[string]int64 {
+			m := map[string]int64{}
+			scRepeatInvalid.Range(func(k, v any) bool { m[k.(string)] = v.(*atomic.Int64).Load(); return true })
+			return m
+		}(),
 		"requests_by_category": byKey,
 	}
 	b, _ := json.Marshal(out)

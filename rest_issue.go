@@ -150,6 +150,10 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request, rp *Repo, 
 	if len(p) == 1 {
 		switch r.Method {
 		case "GET":
+			if rw, ok := w.(*rawResponseWriter); ok {
+				rw.repIssue = iss
+				rw.repBody = cachedIssueJSON(iss)
+			}
 			if writeCachedResponse(w, cachedIssueHTTP(iss)) {
 				return
 			}

@@ -11,9 +11,13 @@ package main
 // small subset of *http.Request / http.ResponseWriter they actually use.
 // Hot cached paths bypass the adapter entirely via WriteCached: a
 // pre-serialized full HTTP response goes straight to conn.Write.
+// Non-git GET requests additionally use a per-connection exact-byte repeat
+// fast path: an identical raw request reuses its pre-serialized response with
+// no parsing, routing, or handler dispatch.
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -27,6 +31,8 @@ const (
 	rawSmallBufSize = 8 << 10   // clone/read/ls-refs requests are ~440 B total
 	rawLargeBufSize = 512 << 10 // swapped in only for large bodies (receive-pack)
 )
+
+var errRepeat = errors.New("raw: repeat request")
 
 type rawBuf struct{ b []byte }
 
@@ -52,6 +58,7 @@ type rawRequest struct {
 	ContentLength int
 	Close         bool
 	Body          []byte
+	Raw           []byte // exact request bytes (head + body)
 }
 
 type rawConnState struct {
@@ -61,18 +68,36 @@ type rawConnState struct {
 	rstart int     // start of the current unparsed request
 	out    *rawBuf // pooled full-response scratch buffer
 	body   *rawBuf // pooled response-body accumulation buffer
+
+	// Reusable adapter objects (avoid per-request allocations on the hot path).
+	hreq   http.Request
+	hurl   url.URL
+	hdr    http.Header
+	reader *bytes.Reader
+	hbody  io.ReadCloser
+	uriBuf []byte
+
+	// Per-connection exact-byte repeat fast path (non-git GET only).
+	repReq   []byte // owned copy of the last GET request's exact bytes
+	repResp  []byte // its pre-serialized full HTTP response
+	repIssue *Issue // issue whose atomic cache is checked for invalidation
+	repBody  []byte // last observed cached body (revision token)
 }
 
 func newRawConnState(conn net.Conn) *rawConnState {
 	if nd, ok := conn.(interface{ SetNoDelay(bool) error }); ok {
 		_ = nd.SetNoDelay(true)
 	}
-	return &rawConnState{
-		conn: conn,
-		buf:  rawSmallPool.Get().(*rawBuf),
-		out:  rawOutPool.Get().(*rawBuf),
-		body: rawOutPool.Get().(*rawBuf),
+	c := &rawConnState{
+		conn:   conn,
+		buf:    rawSmallPool.Get().(*rawBuf),
+		out:    rawOutPool.Get().(*rawBuf),
+		body:   rawOutPool.Get().(*rawBuf),
+		hdr:    make(http.Header, 6),
+		reader: bytes.NewReader(nil),
 	}
+	c.hbody = io.NopCloser(c.reader)
+	return c
 }
 
 func (c *rawConnState) release() {
@@ -123,8 +148,31 @@ func (c *rawConnState) readAppend() (int, error) {
 var crlfcrlf = []byte("\r\n\r\n")
 var crlf = []byte("\r\n")
 
+// repeatValid reports whether the cached repeat response is still valid. An
+// issue GET is invalidated when that issue's atomic cached-body pointer changes.
+func (c *rawConnState) repeatValid() bool {
+	if c.repResp == nil {
+		return false
+	}
+	if c.repIssue == nil {
+		return true
+	}
+	p := c.repIssue.cache.Load()
+	if p == nil {
+		syscountRepeatInvalid("nilptr")
+		return false
+	}
+	if !samePack(*p, c.repBody) {
+		syscountRepeatInvalid("revision")
+		return false
+	}
+	return true
+}
+
 // nextRequest parses exactly one request from the reusable buffer, performing
-// one conn.Read for the common case where head and body arrive together.
+// one conn.Read for the common case where head and body arrive together. If the
+// buffered bytes match the previous GET request exactly (and it is still
+// valid), parsing is skipped entirely and errRepeat is returned.
 func (c *rawConnState) nextRequest() (*rawRequest, error) {
 	if c.rstart > 0 {
 		copy(c.buf.b, c.buf.b[c.rstart:c.rend])
@@ -133,6 +181,15 @@ func (c *rawConnState) nextRequest() (*rawRequest, error) {
 	}
 	var readErr error
 	for {
+		// Exact-byte repeat fast path: match the raw prefix before parsing.
+		if c.repResp != nil && c.repeatValid() {
+			syscountRepeatTry()
+			n := len(c.repReq)
+			if c.rend >= n && bytes.Equal(c.buf.b[:n], c.repReq) {
+				c.rstart = n
+				return nil, errRepeat
+			}
+		}
 		if idx := bytes.Index(c.buf.b[:c.rend], crlfcrlf); idx >= 0 {
 			he := idx + len(crlfcrlf)
 			req, err := parseRequestHead(c.buf.b[:he])
@@ -154,6 +211,7 @@ func (c *rawConnState) nextRequest() (*rawRequest, error) {
 				}
 			}
 			req.Body = c.buf.b[he:end]
+			req.Raw = c.buf.b[:end]
 			c.rstart = end
 			return req, nil
 		}
@@ -164,8 +222,17 @@ func (c *rawConnState) nextRequest() (*rawRequest, error) {
 	}
 }
 
-// parseRequestHead scans the request line and headers in place. The only
-// allocations are the few short strings materialized for the fixed fields.
+var (
+	bContentLength = []byte("content-length")
+	bAuthorization = []byte("authorization")
+	bGitProtocol   = []byte("git-protocol")
+	bHost          = []byte("host")
+	bConnection    = []byte("connection")
+	bClose         = []byte("close")
+)
+
+// parseRequestHead scans the request line and headers in place. Header names
+// are compared with bytes.EqualFold, so no per-header string is allocated.
 func parseRequestHead(head []byte) (*rawRequest, error) {
 	lineEnd := bytes.Index(head, crlf)
 	if lineEnd < 0 {
@@ -209,16 +276,16 @@ func parseRequestHead(head []byte) (*rawRequest, error) {
 			val = val[1:]
 		}
 		switch {
-		case strings.EqualFold(string(name), "Content-Length"):
+		case bytes.EqualFold(name, bContentLength):
 			req.ContentLength, _ = strconv.Atoi(string(val))
-		case strings.EqualFold(string(name), "Authorization"):
+		case bytes.EqualFold(name, bAuthorization):
 			req.Authorization = string(val)
-		case strings.EqualFold(string(name), "Git-Protocol"):
+		case bytes.EqualFold(name, bGitProtocol):
 			req.GitProtocol = string(val)
-		case strings.EqualFold(string(name), "Host"):
+		case bytes.EqualFold(name, bHost):
 			req.Host = string(val)
-		case strings.EqualFold(string(name), "Connection"):
-			if strings.EqualFold(string(val), "close") {
+		case bytes.EqualFold(name, bConnection):
+			if bytes.EqualFold(val, bClose) {
 				req.Close = true
 			}
 		}
@@ -226,33 +293,39 @@ func parseRequestHead(head []byte) (*rawRequest, error) {
 	return req, nil
 }
 
+// httpRequest reuses the connection's adapter objects to avoid allocating a
+// new http.Request, url.URL, header map, and body reader on every request.
 func (c *rawConnState) httpRequest(req *rawRequest) *http.Request {
-	u := &url.URL{Path: req.Path, RawQuery: req.RawQuery}
-	h := make(http.Header, 4)
+	clear(c.hdr)
 	if req.Authorization != "" {
-		h.Set("Authorization", req.Authorization)
+		c.hdr.Set("Authorization", req.Authorization)
 	}
 	if req.GitProtocol != "" {
-		h.Set("Git-Protocol", req.GitProtocol)
+		c.hdr.Set("Git-Protocol", req.GitProtocol)
 	}
 	if req.Host != "" {
-		h.Set("Host", req.Host)
+		c.hdr.Set("Host", req.Host)
 	}
-	target := req.Path
+	c.hurl.Path = req.Path
+	c.hurl.RawQuery = req.RawQuery
+	c.uriBuf = append(c.uriBuf[:0], req.Path...)
 	if req.RawQuery != "" {
-		target += "?" + req.RawQuery
+		c.uriBuf = append(c.uriBuf, '?')
+		c.uriBuf = append(c.uriBuf, req.RawQuery...)
 	}
-	return &http.Request{
-		Method:     req.Method,
-		URL:        u,
-		Header:     h,
-		Host:       req.Host,
-		Body:       io.NopCloser(bytes.NewReader(req.Body)),
-		RequestURI: target,
-		Proto:      "HTTP/1.1",
-		ProtoMajor: 1,
-		ProtoMinor: 1,
-	}
+	c.reader.Reset(req.Body)
+	r := &c.hreq
+	r.Method = req.Method
+	r.URL = &c.hurl
+	r.Header = c.hdr
+	r.Host = req.Host
+	r.Body = c.hbody
+	r.RequestURI = string(c.uriBuf)
+	r.Proto = "HTTP/1.1"
+	r.ProtoMajor = 1
+	r.ProtoMinor = 1
+	r.ContentLength = int64(req.ContentLength)
+	return r
 }
 
 type rawResponseWriter struct {
@@ -261,6 +334,8 @@ type rawResponseWriter struct {
 	body        []byte
 	wroteHeader bool
 	cached      []byte // pre-serialized full response, set by WriteCached
+	repIssue    *Issue // issue to arm the repeat fast path on
+	repBody     []byte // cached body revision token
 }
 
 func (rw *rawResponseWriter) Header() http.Header { return rw.hdr }
@@ -293,6 +368,8 @@ func (rw *rawResponseWriter) reset(bodyBuf []byte) {
 	rw.body = bodyBuf[:0]
 	rw.wroteHeader = false
 	rw.cached = nil
+	rw.repIssue = nil
+	rw.repBody = nil
 }
 
 func (c *rawConnState) flush(rw *rawResponseWriter) error {
@@ -327,11 +404,32 @@ func (c *rawConnState) flush(rw *rawResponseWriter) error {
 	if !noBody {
 		out = append(out, rw.body...)
 	}
-	if cap(out) > cap(c.out.b) {
-		c.out.b = out
-	}
+	c.out.b = out // retain exact written length (and any growth)
 	_, err := c.conn.Write(out)
 	return err
+}
+
+// armRepeat stores a successful non-git GET response for the next identical
+// request on this connection.
+func (c *rawConnState) armRepeat(req *rawRequest, rw *rawResponseWriter) {
+	// Only issue GETs are repeatable: they carry an atomic cache pointer that
+	// is cleared on every mutation, so a stale response can never be served.
+	if req.Method != "GET" || rw.repIssue == nil {
+		c.repResp = nil
+		c.repReq = c.repReq[:0]
+		c.repIssue = nil
+		c.repBody = nil
+		return
+	}
+	resp := rw.cached
+	if resp == nil {
+		resp = c.out.b // flush() built the full response here
+	}
+	c.repReq = append(c.repReq[:0], req.Raw...)
+	c.repResp = resp
+	c.repIssue = rw.repIssue
+	c.repBody = rw.repBody
+	syscountRepeatArmed()
 }
 
 func serveRawConn(conn net.Conn, s *Server) {
@@ -340,8 +438,28 @@ func serveRawConn(conn net.Conn, s *Server) {
 	rw := &rawResponseWriter{hdr: make(http.Header, 6)}
 	for {
 		req, err := c.nextRequest()
+		if errors.Is(err, errRepeat) {
+			// syscountRequest was already counted on the original request;
+			// count the repeat here so totals match the baseline request count.
+			syscountRepeat()
+			if _, err = c.conn.Write(c.repResp); err != nil {
+				return
+			}
+			continue
+		}
 		if err != nil {
 			return
+		}
+		// Fast create-issue POST: bypass adapter and routing entirely.
+		if full, ok := fastCreateIssue(req); ok {
+			syscountFastCreate()
+			syscountRequest("POST", req.Path, req.RawQuery)
+			if _, err = c.conn.Write(full); err != nil {
+				return
+			}
+			c.repResp = nil
+			c.repReq = c.repReq[:0]
+			continue
 		}
 		// syscountRequest is invoked inside ServeHTTP, identical to baseline.
 		hreq := c.httpRequest(req)
@@ -356,6 +474,7 @@ func serveRawConn(conn net.Conn, s *Server) {
 		if err != nil {
 			return
 		}
+		c.armRepeat(req, rw)
 		if req.Close {
 			return
 		}

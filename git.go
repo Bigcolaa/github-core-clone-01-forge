@@ -43,22 +43,58 @@ type packedRef struct {
 	Unborn bool
 }
 
-func pkt(payload []byte) []byte {
-	out := make([]byte, 4+len(payload))
-	b := strconv.FormatInt(int64(len(payload)+4), 16)
-	for len(b) < 4 {
-		b = "0" + b
-	}
-	copy(out, b)
-	copy(out[4:], payload)
-	return out
+const hexDigits = "0123456789abcdef"
+
+// appendHex4 writes n as exactly four lowercase hex digits (n < 65536) with
+// no strconv.FormatInt allocation.
+func appendHex4(dst []byte, n int) []byte {
+	return append(dst,
+		hexDigits[(n>>12)&0xf], hexDigits[(n>>8)&0xf],
+		hexDigits[(n>>4)&0xf], hexDigits[n&0xf])
 }
 
-func pktStr(s string) []byte { return pkt([]byte(s)) }
+// hexNibble decodes one ASCII hex digit, or -1.
+func hexNibble(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
+	}
+	return -1
+}
 
-func appendPkt(dst []byte, payload []byte) []byte { return append(dst, pkt(payload)...) }
+// hex4 decodes a four-digit pkt-line length.
+func hex4(b []byte) (int, bool) {
+	a, c, d, e := hexNibble(b[0]), hexNibble(b[1]), hexNibble(b[2]), hexNibble(b[3])
+	if a < 0 || c < 0 || d < 0 || e < 0 {
+		return 0, false
+	}
+	return (a << 12) | (c << 8) | (d << 4) | e, true
+}
 
-func appendPktStr(dst []byte, s string) []byte { return append(dst, pktStr(s)...) }
+// appendPkt writes a pkt-line directly into dst: no intermediate allocation.
+func appendPkt(dst []byte, payload []byte) []byte {
+	dst = appendHex4(dst, len(payload)+4)
+	return append(dst, payload...)
+}
+
+func appendPktStr(dst []byte, s string) []byte {
+	dst = appendHex4(dst, len(s)+4)
+	return append(dst, s...)
+}
+
+func pkt(payload []byte) []byte {
+	out := make([]byte, 0, 4+len(payload))
+	return appendPkt(out, payload)
+}
+
+func pktStr(s string) []byte {
+	out := make([]byte, 0, 4+len(s))
+	return appendPktStr(out, s)
+}
 
 var (
 	flushPkt = []byte("0000")
@@ -70,23 +106,23 @@ func decodePkts(data []byte) ([]string, []byte) {
 	out := []string{}
 	i := 0
 	for i+4 <= len(data) {
-		h := string(data[i : i+4])
-		if h == "0000" {
+		h := data[i : i+4]
+		if bytes.Equal(h, flushPkt) {
 			out = append(out, "flush")
 			i += 4
 			return out, data[i:]
 		}
-		if h == "0001" {
+		if bytes.Equal(h, delimPkt) {
 			out = append(out, "delim")
 			i += 4
 			continue
 		}
-		n, err := strconv.ParseUint(h, 16, 16)
-		if err != nil || int(n) < 4 || i+int(n) > len(data) {
+		n, ok := hex4(h)
+		if !ok || n < 4 || i+n > len(data) {
 			break
 		}
-		out = append(out, string(data[i+4:i+int(n)]))
-		i += int(n)
+		out = append(out, string(data[i+4:i+n]))
+		i += n
 	}
 	return out, data[i:]
 }
@@ -387,8 +423,11 @@ func parseFetchRequest(body []byte) fetchRequest {
 // fetchV2RespCache / fetchV0RespCache cache the complete response body keyed
 // on the cached pack slice, so the whole fetch reply becomes a stable []byte
 // that writeCachedBody can serve with a single conn.Write.
-var fetchV2RespCache atomic.Pointer[framedPackEntry]
-var fetchV0RespCache atomic.Pointer[framedPackEntry]
+var (
+	fetchV2RespCache atomic.Pointer[framedPackEntry]
+	fetchV0RespCache atomic.Pointer[framedPackEntry]
+	fetchRespGen     sync.Mutex // dedups concurrent cold fetch-response assembly
+)
 
 func samePack(a, b []byte) bool {
 	return len(a) == len(b) && len(a) > 0 && &a[0] == &b[0]
@@ -411,6 +450,11 @@ func (rp *Repo) handleFetchV2(body []byte) []byte {
 	}
 	fr := parseFetchRequest(body)
 	pack, shallowLines, unshallowLines := rp.packFor(fr)
+	if p := fetchV2RespCache.Load(); p != nil && samePack(p.src, pack) {
+		return p.framed
+	}
+	fetchRespGen.Lock()
+	defer fetchRespGen.Unlock()
 	if p := fetchV2RespCache.Load(); p != nil && samePack(p.src, pack) {
 		return p.framed
 	}
@@ -441,6 +485,11 @@ func (rp *Repo) handleFetchV0(body []byte) []byte {
 	if p := fetchV0RespCache.Load(); p != nil && samePack(p.src, pack) {
 		return p.framed
 	}
+	fetchRespGen.Lock()
+	defer fetchRespGen.Unlock()
+	if p := fetchV0RespCache.Load(); p != nil && samePack(p.src, pack) {
+		return p.framed
+	}
 	var out []byte
 	for _, s := range unshallowLines {
 		out = appendPktStr(out, "unshallow "+s+"\n")
@@ -468,12 +517,18 @@ type framedPackEntry struct {
 }
 
 var framedPackCache atomic.Pointer[framedPackEntry]
+var framedPackGen sync.Mutex // dedups concurrent framing of the same cold pack
 
 func framedSidebandPack(pack []byte) []byte {
 	if len(pack) == 0 {
 		pack = emptyPack()
 	}
-	if p := framedPackCache.Load(); p != nil && len(p.src) == len(pack) && &p.src[0] == &pack[0] {
+	if p := framedPackCache.Load(); p != nil && samePack(p.src, pack) {
+		return p.framed
+	}
+	framedPackGen.Lock()
+	defer framedPackGen.Unlock()
+	if p := framedPackCache.Load(); p != nil && samePack(p.src, pack) {
 		return p.framed
 	}
 	const chunk = 65000

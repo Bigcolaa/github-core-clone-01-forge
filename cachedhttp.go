@@ -33,6 +33,16 @@ func writeCachedResponse(w http.ResponseWriter, full []byte) bool {
 const cachedRequestID = "forge-cache"
 
 func fullHTTPResponse(status int, contentType string, withRequestID bool, body []byte) []byte {
+	id := ""
+	if withRequestID {
+		id = cachedRequestID
+	}
+	return fullHTTPResponseID(status, contentType, id, body)
+}
+
+// fullHTTPResponseID assembles a complete HTTP/1.1 response with direct
+// []byte appends (no fmt or encoding/json in the hot path).
+func fullHTTPResponseID(status int, contentType, reqID string, body []byte) []byte {
 	out := make([]byte, 0, len(body)+256)
 	out = append(out, "HTTP/1.1 "...)
 	out = strconv.AppendInt(out, int64(status), 10)
@@ -44,9 +54,9 @@ func fullHTTPResponse(status int, contentType string, withRequestID bool, body [
 		out = append(out, contentType...)
 		out = append(out, "\r\n"...)
 	}
-	if withRequestID {
+	if reqID != "" {
 		out = append(out, "X-GitHub-Request-Id: "...)
-		out = append(out, cachedRequestID...)
+		out = append(out, reqID...)
 		out = append(out, "\r\n"...)
 	}
 	out = append(out, "Content-Length: "...)
